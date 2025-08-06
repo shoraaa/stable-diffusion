@@ -1,4 +1,4 @@
-# pytorch-stable-diffusion
+# Stable Diffusion
 PyTorch implementation of Stable Diffusion from scratch
 
 ## Download weights and tokenizer files:
