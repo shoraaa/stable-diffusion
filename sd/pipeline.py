@@ -64,7 +64,8 @@ def generate(
     device: Optional[str] = None,
     idle_device: Optional[str] = None,
     tokenizer: Any = None,
-    cancel_flag = None
+    cancel_flag = None,
+    progress_callback = None
 ) -> np.ndarray:
     """
     Generate images using Stable Diffusion with text prompts.
@@ -120,6 +121,9 @@ def generate(
                                    Models not currently in use will be moved here.
         tokenizer: Text tokenizer for converting prompts to token IDs.
                   Should be compatible with CLIP tokenization.
+        cancel_flag: Threading event for cancelling generation early.
+        progress_callback: Optional callback function to receive intermediate images.
+                         Called with (step, image_array) during denoising process.
     
     Returns:
         np.ndarray: Generated image as numpy array with shape (height, width, 3).
@@ -277,10 +281,19 @@ def generate(
         
         # Initialize the denoising sampler with specified algorithm
         if sampler_name == "ddpm":
+            from ddpm import DDPMSampler
+            print(f"Using DDPM sampler with {n_inference_steps} steps")
             sampler = DDPMSampler(generator)
             sampler.set_inference_timesteps(n_inference_steps)
+        elif sampler_name == "ddim":
+            from ddim import DDIMSampler
+            print(f"Using DDIM sampler with {n_inference_steps} steps")
+            # Recommended value: eta=0.0 for deterministic sampling (pure DDIM)
+            # Higher eta values (up to 1.0) make it more like DDPM (more stochastic)
+            sampler = DDIMSampler(generator, eta=0.0)  
+            sampler.set_inference_timesteps(n_inference_steps)
         else:
-            raise ValueError("Unknown sampler value %s. ")
+            raise ValueError(f"Unknown sampler value '{sampler_name}'. Supported values: 'ddpm', 'ddim'")
 
         # Define latent space dimensions for VAE
         # Latents are 1/8 resolution of final image with 4 channels
@@ -374,19 +387,33 @@ def generate(
 
             # REAL-TIME PREVIEW: Generate and display intermediate image
             # This allows monitoring the generation progress
-            copied_latents = latents.clone()
-            images = decoder(copied_latents)
-            # Convert from [-1, 1] to [0, 255] range
-            images = rescale(images, (-1, 1), (0, 255), clamp=True)
-            # Rearrange dimensions for display: (Batch, Channel, H, W) -> (Batch, H, W, Channel)
-            images = images.permute(0, 2, 3, 1)
-            # Convert to numpy for matplotlib display
-            images = images.to("cpu", torch.uint8).numpy()
+            if progress_callback is not None:
+                copied_latents = latents.clone()
+                images = decoder(copied_latents)
+                # Convert from [-1, 1] to [0, 255] range
+                images = rescale(images, (-1, 1), (0, 255), clamp=True)
+                # Rearrange dimensions for display: (Batch, Channel, H, W) -> (Batch, H, W, Channel)
+                images = images.permute(0, 2, 3, 1)
+                # Convert to numpy for callback
+                images = images.to("cpu", torch.uint8).numpy()
+                
+                # Call the progress callback with current step and image
+                progress_callback(i + 1, images[0])
+            else:
+                # Fallback to matplotlib display if no callback provided
+                copied_latents = latents.clone()
+                images = decoder(copied_latents)
+                # Convert from [-1, 1] to [0, 255] range
+                images = rescale(images, (-1, 1), (0, 255), clamp=True)
+                # Rearrange dimensions for display: (Batch, Channel, H, W) -> (Batch, H, W, Channel)
+                images = images.permute(0, 2, 3, 1)
+                # Convert to numpy for matplotlib display
+                images = images.to("cpu", torch.uint8).numpy()
 
-            # Display current generation state
-            plt.imshow(images[0])
-            plt.axis('off')
-            plt.show()
+                # Display current generation state
+                plt.imshow(images[0])
+                plt.axis('off')
+                plt.show()
 
         # Move diffusion model to idle device after processing
         to_idle(diffusion)
