@@ -63,6 +63,7 @@ def generate(
     device: Optional[str] = None,
     idle_device: Optional[str] = None,
     tokenizer: Any = None,
+    cancel_flag = None
 ) -> np.ndarray:
     """
     Generate images using Stable Diffusion with text prompts.
@@ -298,6 +299,8 @@ def generate(
         # Main denoising loop with progress bar
         timesteps = tqdm(sampler.timesteps)
         for i, timestep in enumerate(timesteps):
+            if cancel_flag is not None and cancel_flag.is_set():
+                return None
             # Generate time embedding for current timestep
             # U-Net needs to know what noise level it's working with
             time_embedding = get_time_embedding(timestep).to(device)
