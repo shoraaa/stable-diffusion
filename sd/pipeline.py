@@ -53,6 +53,7 @@ def generate(
     prompt: str,
     uncond_prompt: Optional[str] = None,
     input_image: Optional[Image.Image] = None,
+    mask_image: Optional[Union[Image.Image, np.ndarray]] = None,
     strength: float = 0.8,
     do_cfg: bool = True,
     cfg_scale: float = 7.5,
@@ -69,15 +70,16 @@ def generate(
     Generate images using Stable Diffusion with text prompts.
     
     This is the main inference function that orchestrates the complete Stable Diffusion
-    pipeline. It supports both text-to-image and image-to-image generation with
+    pipeline. It supports text-to-image, image-to-image, and inpainting generation with
     configurable parameters for quality, creativity, and performance.
     
     The generation process:
     1. Encode text prompt(s) using CLIP text encoder
-    2. Initialize latent noise (random or from input image)
+    2. Initialize latent noise (random, from input image, or with inpainting mask)
     3. Iteratively denoise latents using U-Net with DDPM sampling
-    4. Decode final latents to RGB image using VAE decoder
-    5. Apply classifier-free guidance for improved prompt adherence
+    4. Apply inpainting blending if mask is provided
+    5. Decode final latents to RGB image using VAE decoder
+    6. Apply classifier-free guidance for improved prompt adherence
     
     Args:
         prompt (str): Main text prompt describing the desired image.
@@ -85,9 +87,12 @@ def generate(
         uncond_prompt (Optional[str]): Negative prompt for classifier-free guidance.
                                      Used to specify what to avoid in the image.
                                      Defaults to empty string if do_cfg=True.
-        input_image (Optional[PIL.Image]): Input image for image-to-image generation.
-                                         If provided, will be encoded to latent space
-                                         and used as starting point for denoising.
+        input_image (Optional[PIL.Image]): Input image for image-to-image or inpainting.
+                                         If provided with mask_image, enables inpainting.
+                                         If provided without mask, enables img2img.
+        mask_image (Optional[Union[PIL.Image, np.ndarray]]): Mask for inpainting.
+                                         White areas = inpaint, black areas = preserve.
+                                         Only used when input_image is also provided.
         strength (float): Denoising strength for image-to-image generation (0.0-1.0).
                          Higher values = more deviation from input image.
                          Lower values = closer to input image. Default: 0.8
@@ -143,11 +148,22 @@ def generate(
         ...     models=loaded_models,
         ...     device="cuda"
         ... )
+        
+        >>> # Inpainting generation
+        >>> inpainted_image = generate(
+        ...     prompt="a beautiful flower garden",
+        ...     input_image=original_image,
+        ...     mask_image=mask_array,
+        ...     strength=0.8,
+        ...     models=loaded_models,
+        ...     device="cuda"
+        ... )
     
     Note:
         - Generation quality increases with more inference steps but takes longer
         - CFG scale 7.5 provides good balance between prompt adherence and creativity
         - For image-to-image, strength 0.8 provides good balance between similarity and change
+        - For inpainting, white mask areas are regenerated, black areas are preserved
         - Uses approximately 4-6GB GPU memory during generation
         - Real-time preview images are displayed during generation using matplotlib
     """
@@ -159,6 +175,29 @@ def generate(
         # Validate strength parameter for image-to-image generation
         if not 0 < strength <= 1:
             raise ValueError("strength must be between 0 and 1")
+        
+        # Check for inpainting mode
+        is_inpainting = input_image is not None and mask_image is not None
+        
+        # Import inpainting functionality if needed
+        if is_inpainting:
+            from inpainting import inpaint
+            return inpaint(
+                prompt=prompt,
+                image=input_image,
+                mask=mask_image,
+                uncond_prompt=uncond_prompt,
+                strength=strength,
+                do_cfg=do_cfg,
+                cfg_scale=cfg_scale,
+                sampler_name=sampler_name,
+                n_inference_steps=n_inference_steps,
+                models=models,
+                seed=seed,
+                device=device,
+                idle_device=idle_device,
+                tokenizer=tokenizer,
+            )
 
         # Setup device management for memory efficiency
         # Models not in use can be moved to idle_device to save GPU memory
