@@ -37,7 +37,6 @@ from tqdm import tqdm
 from typing import Optional, Dict, Any, Union
 from PIL import Image
 
-from ddpm import DDPMSampler
 import matplotlib.pyplot as plt
 
 # ============================================================================= 
@@ -57,7 +56,7 @@ def generate(
     strength: float = 0.8,
     do_cfg: bool = True,
     cfg_scale: float = 7.5,
-    sampler_name: str = "ddpm",
+    sampler_name: str = "ddim",
     n_inference_steps: int = 50,
     models: Dict[str, torch.nn.Module] = {},
     seed: Optional[int] = None,
@@ -65,7 +64,9 @@ def generate(
     idle_device: Optional[str] = None,
     tokenizer: Any = None,
     cancel_flag = None,
-    progress_callback = None
+    progress_callback = None,
+    width: int = 512,
+    height: int = 512
 ) -> np.ndarray:
     """
     Generate images using Stable Diffusion with text prompts.
@@ -103,7 +104,10 @@ def generate(
         cfg_scale (float): Classifier-free guidance scale (1.0-20.0).
                           Higher values = stronger prompt adherence.
                           Lower values = more creative freedom. Default: 7.5
-        sampler_name (str): Sampling algorithm to use. Currently supports "ddpm".
+        sampler_name (str): Sampling algorithm to use. Currently supports:
+                           - "ddpm": DDPM sampling (stochastic, high quality)
+                           - "ddim": DDIM sampling (deterministic, faster)
+                           - "euler": Euler sampling (deterministic, efficient)
                            Default: "ddpm"
         n_inference_steps (int): Number of denoising steps (1-1000).
                                More steps = higher quality but slower generation.
@@ -124,6 +128,10 @@ def generate(
         cancel_flag: Threading event for cancelling generation early.
         progress_callback: Optional callback function to receive intermediate images.
                          Called with (step, image_array) during denoising process.
+        width (int): Output image width in pixels. Must be divisible by 8 for VAE.
+                    Common values: 512, 768, 1024. Default: 512
+        height (int): Output image height in pixels. Must be divisible by 8 for VAE.
+                     Common values: 512, 768, 1024. Default: 512
     
     Returns:
         np.ndarray: Generated image as numpy array with shape (height, width, 3).
@@ -149,6 +157,7 @@ def generate(
         ...     prompt="same landscape but in winter with snow",
         ...     input_image=input_pil_image,
         ...     strength=0.7,
+        ...     sampler_name="ddim",  # Use DDIM for faster generation
         ...     models=loaded_models,
         ...     device="cuda"
         ... )
@@ -162,6 +171,15 @@ def generate(
         ...     models=loaded_models,
         ...     device="cuda"
         ... )
+        
+        >>> # Fast generation with Euler sampling
+        >>> fast_image = generate(
+        ...     prompt="a cyberpunk cityscape at night",
+        ...     sampler_name="euler",
+        ...     n_inference_steps=20,  # Fewer steps work well with Euler
+        ...     models=loaded_models,
+        ...     device="cuda"
+        ... )
     
     Note:
         - Generation quality increases with more inference steps but takes longer
@@ -170,6 +188,11 @@ def generate(
         - For inpainting, white mask areas are regenerated, black areas are preserved
         - Uses approximately 4-6GB GPU memory during generation
         - Real-time preview images are displayed during generation using matplotlib
+        
+        Sampler Recommendations:
+        - DDPM: Highest quality, slowest (50-100 steps recommended)
+        - DDIM: Good quality, faster, deterministic (20-50 steps recommended)
+        - Euler: Fast and efficient, good quality (15-30 steps recommended)
     """
     with torch.no_grad():
         # =====================================================================
@@ -179,6 +202,20 @@ def generate(
         # Validate strength parameter for image-to-image generation
         if not 0 < strength <= 1:
             raise ValueError("strength must be between 0 and 1")
+        
+        # Validate width and height parameters
+        if width % 8 != 0:
+            raise ValueError(f"Width must be divisible by 8, got {width}")
+        if height % 8 != 0:
+            raise ValueError(f"Height must be divisible by 8, got {height}")
+        if width < 64 or width > 2048:
+            raise ValueError(f"Width must be between 64 and 2048, got {width}")
+        if height < 64 or height > 2048:
+            raise ValueError(f"Height must be between 64 and 2048, got {height}")
+        
+        # Calculate latent dimensions from dynamic width/height
+        latents_width = width // 8
+        latents_height = height // 8
         
         # Check for inpainting mode
         is_inpainting = input_image is not None and mask_image is not None
@@ -201,6 +238,8 @@ def generate(
                 device=device,
                 idle_device=idle_device,
                 tokenizer=tokenizer,
+                width=width,
+                height=height,
             )
 
         # Setup device management for memory efficiency
@@ -281,23 +320,28 @@ def generate(
         
         # Initialize the denoising sampler with specified algorithm
         if sampler_name == "ddpm":
-            from ddpm import DDPMSampler
+            from sampler import DDPMSampler
             print(f"Using DDPM sampler with {n_inference_steps} steps")
             sampler = DDPMSampler(generator)
             sampler.set_inference_timesteps(n_inference_steps)
         elif sampler_name == "ddim":
-            from ddim import DDIMSampler
+            from sampler import DDIMSampler
             print(f"Using DDIM sampler with {n_inference_steps} steps")
             # Recommended value: eta=0.0 for deterministic sampling (pure DDIM)
             # Higher eta values (up to 1.0) make it more like DDPM (more stochastic)
-            sampler = DDIMSampler(generator, eta=0.0)  
+            sampler = DDIMSampler(generator)  
+            sampler.set_inference_timesteps(n_inference_steps)
+        elif sampler_name == "euler":
+            from sampler import EulerSampler
+            print(f"Using Euler sampler with {n_inference_steps} steps")
+            sampler = EulerSampler(generator)
             sampler.set_inference_timesteps(n_inference_steps)
         else:
-            raise ValueError(f"Unknown sampler value '{sampler_name}'. Supported values: 'ddpm', 'ddim'")
+            raise ValueError(f"Unknown sampler value '{sampler_name}'. Supported values: 'ddpm', 'ddim', 'euler'")
 
         # Define latent space dimensions for VAE
         # Latents are 1/8 resolution of final image with 4 channels
-        latents_shape = (1, 4, LATENTS_HEIGHT, LATENTS_WIDTH)
+        latents_shape = (1, 4, latents_height, latents_width)
 
         # =====================================================================
         # LATENT SPACE INITIALIZATION
@@ -310,7 +354,7 @@ def generate(
 
             # Prepare input image for encoding
             # Resize to standard Stable Diffusion dimensions
-            input_image_tensor = input_image.resize((WIDTH, HEIGHT))
+            input_image_tensor = input_image.resize((width, height))
             # Convert PIL image to numpy array: (Height, Width, Channel)
             input_image_tensor = np.array(input_image_tensor)
             # Convert to PyTorch tensor

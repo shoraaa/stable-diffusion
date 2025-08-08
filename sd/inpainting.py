@@ -38,7 +38,6 @@ from tqdm import tqdm
 from typing import Optional, Dict, Any, Union
 from PIL import Image
 
-from ddpm import DDPMSampler
 from pipeline import rescale, get_time_embedding
 
 
@@ -56,13 +55,20 @@ def prepare_mask(mask: Union[Image.Image, np.ndarray], width: int = 512, height:
         torch.Tensor: Processed mask tensor with shape (1, 1, height, width)
                      Values are 0 (preserve) or 1 (inpaint)
     """
-    # if isinstance(mask, Image.Image):
-    #     # Convert PIL image to numpy array
-    #     mask = np.array(mask.resize((width, height)))
-    # elif isinstance(mask, np.ndarray):
-    #     # Resize numpy array using PIL
-    #     mask_image = Image.fromarray(mask.astype(np.uint8))
-    #     mask = np.array(mask_image.resize((width, height)))
+    # Convert PIL Image to numpy array if needed and resize
+    if isinstance(mask, Image.Image):
+        # Ensure mask is in grayscale and resize
+        if mask.mode != 'L':
+            mask = mask.convert('L')
+        mask = mask.resize((width, height), Image.LANCZOS)
+        mask = np.array(mask)
+    elif isinstance(mask, np.ndarray):
+        # Resize numpy array using PIL if needed
+        if mask.shape[:2] != (height, width):
+            mask_image = Image.fromarray(mask.astype(np.uint8))
+            if len(mask.shape) == 3 and mask.shape[2] > 1:
+                mask_image = mask_image.convert('L')
+            mask = np.array(mask_image.resize((width, height), Image.LANCZOS))
     
     # Convert to binary mask (0 or 1)
     # White pixels (>127) become 1 (inpaint), black pixels (<=127) become 0 (preserve)
@@ -90,8 +96,11 @@ def prepare_masked_image(image: Image.Image, mask: torch.Tensor) -> torch.Tensor
     Returns:
         torch.Tensor: Masked image tensor with shape (1, 3, H, W)
     """
-    # Resize and convert image to tensor
+    # Ensure image is the expected size (should already be resized)
+    if image.size != (512, 512):
+        image = image.resize((512, 512), Image.LANCZOS)
     
+    # Convert image to tensor
     image_tensor = np.array(image)
     image_tensor = torch.tensor(image_tensor, dtype=torch.float32)
     
@@ -100,6 +109,19 @@ def prepare_masked_image(image: Image.Image, mask: torch.Tensor) -> torch.Tensor
     
     # Rearrange dimensions: (H, W, C) -> (1, C, H, W)
     image_tensor = image_tensor.unsqueeze(0).permute(0, 3, 1, 2)
+    
+    # Ensure mask has the same spatial dimensions as image
+    if mask.shape[-2:] != image_tensor.shape[-2:]:
+        # Resize mask to match image dimensions
+        mask = torch.nn.functional.interpolate(
+            mask.float(), 
+            size=image_tensor.shape[-2:], 
+            mode='nearest'
+        )
+    
+    # Ensure both tensors are on the same device
+    # Move image tensor to the same device as mask
+    image_tensor = image_tensor.to(mask.device)
     
     # Apply mask: set masked areas to neutral gray value (0.0 in [-1, 1] range)
     # Expand mask to match image channels: (1, 1, H, W) -> (1, 3, H, W)
@@ -185,7 +207,10 @@ def inpaint(
         # MASK AND IMAGE PREPARATION
         # =====================================================================
         
-        # Prepare mask for inpainting
+        # Ensure image is resized to standard dimensions (512x512)
+        image = image.resize((512, 512), Image.LANCZOS)
+        
+        # Prepare mask for inpainting (also resize to 512x512)
         mask_tensor = prepare_mask(mask, 512, 512).to(device)
         
         # Prepare masked image
@@ -257,10 +282,19 @@ def inpaint(
         # SAMPLING SETUP
         # =====================================================================
         if sampler_name == "ddpm":
+            from sampler import DDPMSampler
             sampler = DDPMSampler(generator)
             sampler.set_inference_timesteps(n_inference_steps)
+        elif sampler_name == "ddim":
+            from sampler import DDIMSampler
+            sampler = DDIMSampler(generator)
+            sampler.set_inference_timesteps(n_inference_steps)
+        elif sampler_name == "euler":
+            from sampler import EulerSampler
+            sampler = EulerSampler(generator)
+            sampler.set_inference_timesteps(n_inference_steps)
         else:
-            raise ValueError(f"Unknown sampler: {sampler_name}")
+            raise ValueError(f"Unknown sampler: {sampler_name}. Supported values: 'ddpm', 'ddim', 'euler'")
 
         # Set strength for inpainting
         sampler.set_strength(strength=strength)
