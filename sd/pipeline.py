@@ -37,7 +37,7 @@ from tqdm import tqdm
 from typing import Optional, Dict, Any, Union
 from PIL import Image
 
-from ddpm import DDPMSampler
+from sampler import DDPMSampler, DDIMSampler, EulerSampler, EulerAncestralSampler
 import matplotlib.pyplot as plt
 
 # ============================================================================= 
@@ -238,10 +238,16 @@ def generate(
         # Initialize the denoising sampler with specified algorithm
         if sampler_name == "ddpm":
             sampler = DDPMSampler(generator)
-            sampler.set_inference_timesteps(n_inference_steps)
+        elif sampler_name == "ddim":
+            sampler = DDIMSampler(generator)
+        elif sampler_name == "euler":
+            sampler = EulerSampler(generator)
+        elif sampler_name == "euler-a":
+            sampler = EulerAncestralSampler(generator)
         else:
             raise ValueError("Unknown sampler value %s. ")
-
+        
+        sampler.set_inference_timesteps(n_inference_steps)
         # Define latent space dimensions for VAE
         # Latents are 1/8 resolution of final image with 4 channels
         latents_shape = (1, 4, LATENTS_HEIGHT, LATENTS_WIDTH)
@@ -329,22 +335,6 @@ def generate(
             # Update latents by removing predicted noise
             # This is one step of the reverse diffusion process
             latents = sampler.step(timestep, latents, model_output)
-
-            # REAL-TIME PREVIEW: Generate and display intermediate image
-            # This allows monitoring the generation progress
-            copied_latents = latents.clone()
-            images = decoder(copied_latents)
-            # Convert from [-1, 1] to [0, 255] range
-            images = rescale(images, (-1, 1), (0, 255), clamp=True)
-            # Rearrange dimensions for display: (Batch, Channel, H, W) -> (Batch, H, W, Channel)
-            images = images.permute(0, 2, 3, 1)
-            # Convert to numpy for matplotlib display
-            images = images.to("cpu", torch.uint8).numpy()
-
-            # Display current generation state
-            plt.imshow(images[0])
-            plt.axis('off')
-            plt.show()
 
         # Move diffusion model to idle device after processing
         to_idle(diffusion)
