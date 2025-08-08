@@ -253,6 +253,72 @@ class BaseSampler:
         return noisy_samples
 
         
+class DDPMOSampler(BaseSampler):
+
+    def step(
+        self, 
+        timestep: int, 
+        latents: torch.Tensor, 
+        model_output: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Perform one reverse diffusion sampling step.
+        
+        This is the core DDPM sampling step that takes a noisy latent and the
+        model's noise prediction to compute the less noisy latent for the next step.
+        
+        Args:
+            timestep (int): Current timestep in the diffusion process
+            latents (torch.Tensor): Current noisy latents 
+            model_output (torch.Tensor): Model's predicted noise
+            
+        Returns:
+            torch.Tensor: Denoised latents for the next step
+        """
+        t = timestep
+        prev_t = self._get_previous_timestep(t)
+
+        # === Step 1: Compute alpha and beta values ===
+        alpha_prod_t = self.alphas_cumprod[t]           # ᾱ_t
+        alpha_prod_t_prev = self.alphas_cumprod[prev_t] if prev_t >= 0 else self.one  # ᾱ_{t-1}
+        beta_prod_t = 1 - alpha_prod_t                  # 1 - ᾱ_t
+        beta_prod_t_prev = 1 - alpha_prod_t_prev        # 1 - ᾱ_{t-1}
+        current_alpha_t = alpha_prod_t / alpha_prod_t_prev  # α_t = ᾱ_t / ᾱ_{t-1}
+        current_beta_t = 1 - current_alpha_t            # β_t = 1 - α_t
+
+        # === Step 2: Predict original sample x_0 ===
+        # From DDPM paper equation (15): x_0 = (x_t - √(1-ᾱ_t) * ε) / √ᾱ_t
+        # where ε is the predicted noise (model_output)
+        pred_original_sample = (latents - beta_prod_t ** 0.5 * model_output) / alpha_prod_t ** 0.5
+
+        # === Step 3: Compute coefficients for mean calculation ===
+        # From DDPM paper equation (7), the mean μ_t is a weighted combination:
+        # μ_t = coeff1 * x_0 + coeff2 * x_t
+        pred_original_sample_coeff = (alpha_prod_t_prev ** 0.5 * current_beta_t) / beta_prod_t
+        current_sample_coeff = current_alpha_t ** 0.5 * beta_prod_t_prev / beta_prod_t
+
+        # === Step 4: Compute predicted mean μ_t ===
+        pred_prev_sample = pred_original_sample_coeff * pred_original_sample + current_sample_coeff * latents
+
+        # === Step 5: Add noise for stochastic sampling ===
+        variance = 0
+        if t > 0:  # No noise added at the final step (t=0)
+            device = model_output.device
+            noise = torch.randn(
+                model_output.shape, 
+                generator=self.generator, 
+                device=device, 
+                dtype=model_output.dtype
+            )
+            # Scale noise by the square root of variance
+            variance = (self._get_variance(t) ** 0.5) * noise
+        
+        # === Step 6: Sample from N(μ_t, σ²_t) ===
+        # Final sample: x_{t-1} = μ_t + σ_t * ε where ε ~ N(0,1)
+        pred_prev_sample = pred_prev_sample + variance
+
+        return pred_prev_sample
+
 class DDPMSampler(BaseSampler):
 
     def step(
@@ -316,6 +382,7 @@ class DDPMSampler(BaseSampler):
         # === Step 6: Sample from N(μ_t, σ²_t) ===
         # Final sample: x_{t-1} = μ_t + σ_t * ε where ε ~ N(0,1)
         pred_prev_sample = pred_prev_sample + variance
+
 
         return pred_prev_sample
 
@@ -439,68 +506,56 @@ class EulerSampler(BaseSampler):
     - Works well with 15-30 sampling steps
     - Good balance between speed and quality
     """
-
-    def step(
-        self, 
-        timestep: int, 
-        latents: torch.Tensor, 
-        model_output: torch.Tensor
-    ) -> torch.Tensor:
+    def step(self, timestep: int, latents: torch.Tensor, model_output: torch.Tensor) -> torch.Tensor:
         """
-        Perform one reverse diffusion sampling step using the Euler method.
-        
-        The Euler method uses first-order numerical integration to solve the
-        reverse-time SDE. It approximates the solution by taking a linear step
-        in the direction of the predicted score (negative gradient of log density).
-        
+        One Euler step for the probability-flow ODE (discrete VP SDE -> ODE).
+
         Args:
-            timestep (int): Current timestep in the diffusion process
-            latents (torch.Tensor): Current noisy latents x_t
-            model_output (torch.Tensor): Model's predicted noise ε_θ(x_t, t)
-            
+            timestep (int): current integer timestep index t (0..T-1 typically)
+            latents (torch.Tensor): x_t, shape (B, C, H, W)
+            model_output (torch.Tensor): predicted noise epsilon_theta(x_t, t), same shape
+
         Returns:
-            torch.Tensor: Denoised latents for the next step x_{t-1}
-            
-        Note:
-            Euler update rule:
-            x_{t-1} = x_t + (t - t_prev) * dx_dt
-            where dx_dt is the derivative estimated from the model output
+            torch.Tensor: x_{t-1} (after one Euler step)
         """
         t = timestep
         prev_t = self._get_previous_timestep(t)
 
-        # === Step 1: Get alpha values for current timestep ===
-        alpha_prod_t = self.alphas_cumprod[t]           # ᾱ_t
-        alpha_prod_t_prev = self.alphas_cumprod[prev_t] if prev_t >= 0 else self.one  # ᾱ_{t-1}
+        # --- gather discrete schedule scalars ---
+        alpha_bar_t = self.alphas_cumprod[t]                           # \bar{alpha}_t (scalar tensor)
+        sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
+        sqrt_one_minus_alpha_bar_t = torch.sqrt(1.0 - alpha_bar_t)
 
-        # === Step 2: Calculate beta and sigma values ===
-        beta_prod_t = 1 - alpha_prod_t                  # 1 - ᾱ_t
-        sqrt_alpha_prod_t = alpha_prod_t ** 0.5         # √ᾱ_t
-        sqrt_beta_prod_t = beta_prod_t ** 0.5           # √(1 - ᾱ_t)
+        # If prev_t < 0 -> final step to x_0
+        if prev_t < 0:
+            # compute direct predicted x0 and return it (final denoised)
+            # x0_hat = (x_t - sqrt(1 - \bar{alpha}_t) * eps) / sqrt(\bar{alpha}_t)
+            x0_pred = (latents - sqrt_one_minus_alpha_bar_t * model_output) / sqrt_alpha_bar_t
+            return x0_pred
 
-        # === Step 3: Predict original sample x_0 ===
-        # x_0 = (x_t - √(1-ᾱ_t) * ε) / √ᾱ_t
-        pred_original_sample = (latents - sqrt_beta_prod_t * model_output) / sqrt_alpha_prod_t
+        # retrieve beta_t (discrete) and convert to scalar
+        beta_t = self.betas[t]   # discrete beta for this step
 
-        # === Step 4: Calculate the derivative dx/dt ===
-        # For the Euler method, we need to estimate the derivative of x with respect to t
-        # This is based on the predicted original sample and current state
-        sqrt_alpha_prod_t_prev = alpha_prod_t_prev ** 0.5
-        sqrt_beta_prod_t_prev = (1 - alpha_prod_t_prev) ** 0.5
+        # --- approximate score from predicted noise ---
+        # For VP formulation: score ≈ - ε / sqrt(1 - \bar{alpha}_t)
+        score_pred = - model_output / sqrt_one_minus_alpha_bar_t
 
-        # Calculate what x_{t-1} should be based on predicted x_0
-        pred_sample_direction = sqrt_alpha_prod_t_prev * pred_original_sample + sqrt_beta_prod_t_prev * model_output
+        # --- ODE drift for probability flow (VP formulation) ---
+        # reverse SDE drift term: f(x,t) = -0.5 * beta_t * x
+        # probability-flow ODE drift: f_ODE = f(x,t) - 0.5 * g(t)^2 * score
+        # For VP SDE, g(t)^2 ≈ beta_t, so:
+        #    dx/dt = -0.5 * beta_t * x  - 0.5 * beta_t * score
+        # => dx/dt = -0.5 * beta_t * ( x + score )
+        dx_dt = -0.5 * beta_t * (latents + score_pred)
 
-        # === Step 5: Compute the Euler step ===
-        # The step size is effectively the difference between consecutive timesteps
-        # in the continuous time formulation
-        if prev_t >= 0:
-            # Calculate the step as the difference between predicted direction and current state
-            # This implements the Euler method: x_{t-1} = x_t + step_size * derivative
-            pred_prev_sample = pred_sample_direction
-        else:
-            # Final step: predict the clean sample directly
-            pred_prev_sample = pred_original_sample
+        # --- choose step size h ---
+        # In a simple discrete integrator, we can take h = 1 (step from index t to t-1).
+        # If you use a custom continuous timestep mapping, set h accordingly.
+        h = -(t - prev_t)  # negative because we integrate backward in time (x_{t-1} = x_t + h * dx/dt)
+                 # using h=-1 corresponds to stepping one discrete unit backward.
+        # (Alternatively use h = -(t_cont - prev_t_cont) when you have continuous times.)
 
-        return pred_prev_sample
+        # Euler update
+        x_prev = latents + h * dx_dt
 
+        return x_prev

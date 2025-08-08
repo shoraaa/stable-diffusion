@@ -37,7 +37,7 @@ from tqdm import tqdm
 from typing import Optional, Dict, Any, Union
 from PIL import Image
 
-from sampler import DDPMSampler, DDIMSampler, EulerSampler, EulerAncestralSampler
+from sampler import DDPMSampler, DDIMSampler, EulerSampler
 import matplotlib.pyplot as plt
 
 # ============================================================================= 
